@@ -1,0 +1,2 @@
+# Daily forecast refresh at 06:15 (server time)
+15 6 * * * /opt/forecast/venv/bin/python /opt/forecast/forecast.py >> /var/log/forecast.log 2>&1

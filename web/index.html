@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exchange Rates</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:800px;margin:20px auto;padding:0 12px;color:#222}
+  table{width:100%;border-collapse:collapse;margin-bottom:24px}
+  th,td{padding:8px;border-bottom:1px solid #ddd;text-align:left}
+  .up{color:#0a8f3c}.down{color:#c62828}
+  select{padding:6px;margin-right:8px;font-size:1rem}
+  #err{color:#c62828}
+  .tabs{display:flex;gap:4px;border-bottom:2px solid #ddd;margin-bottom:16px}
+  .tabs button{padding:8px 16px;border:0;background:none;font-size:1rem;cursor:pointer;color:#555;border-bottom:3px solid transparent;margin-bottom:-2px}
+  .tabs button.active{color:#222;font-weight:600;border-bottom-color:#222}
+  .tab{display:none}
+  .tab.active{display:block}
+  .quake{display:flex;align-items:center;gap:14px;margin:12px 0}
+  .qdot{width:44px;height:44px;border-radius:50%;flex:none}
+  .qdot.green{background:#1faa59;box-shadow:0 0 14px 4px rgba(31,170,89,.6);animation:qblink-green 4s ease-in-out infinite}
+  .qdot.red{background:#d32f2f;box-shadow:0 0 14px 4px rgba(211,47,47,.7);animation:qblink-red .6s ease-in-out infinite}
+  .qdot.gray{background:#9e9e9e}
+  @keyframes qblink-green{0%,85%,100%{opacity:1}92%{opacity:.25}}
+  @keyframes qblink-red{0%,100%{opacity:1}50%{opacity:.2}}
+</style>
+</head>
+<body>
+<h1>Exchange Rates</h1>
+<nav class="tabs">
+  <button class="active" data-tab="current">Current</button>
+  <button data-tab="predictions">Predictions</button>
+  <button data-tab="tech">Tech general</button>
+</nav>
+<div id="tab-current" class="tab active">
+<p id="err"></p>
+
+<h2>Fiat and gold (to UAH, NBU)</h2>
+<table><thead><tr><th>Currency</th><th>Rate, ₴</th></tr></thead><tbody id="fiat"></tbody></table>
+
+<h2>Crypto (USD)</h2>
+<table><thead><tr><th>Coin</th><th>Price, $</th><th>24h</th></tr></thead><tbody id="crypto"></tbody></table>
+
+<h2>Chart</h2>
+<select id="asset"></select>
+<select id="period">
+  <option value="7">7 days</option>
+  <option value="30" selected>30 days</option>
+  <option value="90">90 days</option>
+  <option value="365">1 year</option>
+</select>
+<canvas id="chart" height="120"></canvas>
+</div>
+
+<div id="tab-predictions" class="tab">
+<h2>Predictions</h2>
+<h2>Predictions: Monte Carlo cone</h2>
+<select id="passet"></select>
+<select id="phorizon">
+  <option value="7">7 days</option>
+  <option value="14">14 days</option>
+  <option value="30" selected>30 days</option>
+</select>
+<canvas id="pchart" height="120"></canvas>
+<p id="pnote" style="color:#888;font-size:.9rem"></p>
+<h2>Predictions: ETS forecast (Python)</h2>
+<select id="easset"></select>
+<select id="ehorizon">
+  <option value="7">7 days</option>
+  <option value="14">14 days</option>
+  <option value="30" selected>30 days</option>
+</select>
+<canvas id="echart" height="120"></canvas>
+<p id="enote" style="color:#888;font-size:.9rem"></p>
+</div>
+
+<div id="tab-tech" class="tab">
+<h2>Tech general</h2>
+<h3>Earthquakes in Europe (live, EMSC) <small id="qws" style="font-weight:normal;color:#888">· WebSocket: connecting</small></h3>
+<div class="quake"><div id="qdot" class="qdot gray"></div><div id="qtext">Connecting...</div></div>
+<h3>Server status</h3>
+<div id="techbox">Loading...</div>
+<p><button id="techrefresh">Refresh</button></p>
+</div>
+
+<script>
+const FIAT = ['USD','EUR','PLN','GBP','CNY','JPY','CAD','CHF','AUD','XAU'];
+const CRYPTO = {
+  bitcoin:'BTC', ethereum:'ETH', tether:'USDT', binancecoin:'BNB',
+  ripple:'XRP', solana:'SOL', dogecoin:'DOGE', cardano:'ADA',
+  tron:'TRX', 'the-open-network':'TON', litecoin:'LTC', monero:'XMR'
+};
+const NBU = '/api/nbu/NBUStatService/v1/statdirectory/exchange';
+const CG = '/api/cg/api/v3';
+const $ = id => document.getElementById(id);
+const ymd = d => d.toISOString().slice(0,10).replace(/-/g,'');
+let chart;
+const NAME = {XAU: 'XAU (gold, 1 troy oz)'};
+const fmtRate = v => v.toLocaleString('en-US', {minimumFractionDigits: v < 1 ? 4 : 2, maximumFractionDigits: v < 1 ? 4 : 2});
+
+function fail(e){ console.error(e); $('err').textContent = 'Data loading error: ' + e.message; }
+async function getJSON(url){
+  const r = await fetch(url);
+  if(!r.ok) throw new Error(r.status + ' ' + url.split('?')[0]);
+  return r.json();
+}
+
+async function loadTables(){
+  const [nbu, cg] = await Promise.all([
+    getJSON(NBU + '?json'),
+    getJSON(CG + '/simple/price?ids=' + Object.keys(CRYPTO).join(',') + '&vs_currencies=usd&include_24hr_change=true')
+  ]);
+  $('fiat').innerHTML = FIAT.map(c => {
+    const x = nbu.find(i => i.cc === c);
+    return `<tr><td>${NAME[c] || c}</td><td>${x ? fmtRate(x.rate_per_unit ?? x.rate) : '—'}</td></tr>`;
+  }).join('');
+  $('crypto').innerHTML = Object.entries(CRYPTO).map(([id, sym]) => {
+    const p = cg[id]; if(!p) return '';
+    const ch = p.usd_24h_change || 0;
+    return `<tr><td>${sym}</td><td>${p.usd.toLocaleString('en-US', {maximumFractionDigits: p.usd < 1 ? 5 : 2})}</td>
+      <td class="${ch>=0?'up':'down'}">${ch.toFixed(2)}%</td></tr>`;
+  }).join('');
+}
+
+async function history(asset, days){
+  if(FIAT.includes(asset)){
+    const end = new Date(), start = new Date(Date.now() - days*864e5);
+    const d = await getJSON(`/api/nbu/NBU_Exchange/exchange_site?start=${ymd(start)}&end=${ymd(end)}&valcode=${asset.toLowerCase()}&sort=exchangedate&order=asc&json`);
+    return {labels: d.map(i => i.exchangedate), data: d.map(i => i.rate_per_unit ?? i.rate), cur: '₴'};
+  }
+  const d = await getJSON(`${CG}/coins/${asset}/market_chart?vs_currency=usd&days=${days}`);
+  return {
+    labels: d.prices.map(p => new Date(p[0]).toLocaleDateString('en-GB')),
+    data: d.prices.map(p => p[1]), cur: '$'
+  };
+}
+
+async function drawChart(){
+  try{
+    const asset = $('asset').value, days = $('period').value;
+    const h = await history(asset, days);
+    if(chart) chart.destroy();
+    chart = new Chart($('chart'), {
+      type:'line',
+      data:{labels:h.labels, datasets:[{label:$('asset').selectedOptions[0].text + ', ' + h.cur,
+        data:h.data, borderWidth:2, pointRadius:0, tension:.2}]},
+      options:{scales:{x:{ticks:{maxTicksLimit:8}}}}
+    });
+    $('err').textContent = '';
+  }catch(e){ fail(e); }
+}
+
+$('asset').innerHTML =
+  FIAT.map(c => `<option value="${c}">${c}/UAH</option>`).join('') +
+  Object.entries(CRYPTO).map(([id,s]) => `<option value="${id}">${s}/USD</option>`).join('');
+$('asset').onchange = $('period').onchange = drawChart;
+
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.tabs button, .tab').forEach(e => e.classList.remove('active'));
+  b.classList.add('active');
+  $('tab-' + b.dataset.tab).classList.add('active');
+});
+loadTables().catch(fail);
+async function loadTech(){
+  try{
+    const r = await fetch('/cgi-bin/tech.sh', {cache: 'no-store'});
+    if(!r.ok) throw new Error(r.status + ' /cgi-bin/tech.sh');
+    $('techbox').innerHTML = await r.text();
+  }catch(e){ $('techbox').textContent = 'Failed to load: ' + e.message; }
+}
+document.querySelector('[data-tab="tech"]').addEventListener('click', loadTech);
+$('techrefresh').onclick = loadTech;
+let echart, fdata;
+async function drawEts(){
+  try{
+    if(!fdata){
+      const r = await fetch('/forecast.json', {cache: 'no-store'});
+      if(!r.ok) throw new Error(r.status + ' /forecast.json');
+      fdata = await r.json();
+    }
+    const a = fdata.assets[$('easset').value];
+    if(echart){ echart.destroy(); echart = null; }
+    if(!a){ $('enote').textContent = 'No forecast for this asset yet. Run forecast.py again.'; return; }
+
+    const H = Math.min(+$('ehorizon').value, a.dates.length);
+    const labels = ['Last', ...a.dates.slice(0, H)];
+    const band = k => [a.last, ...a[k].slice(0, H)];
+    const mk = (label, data, extra) => Object.assign({label, data, pointRadius: 0, borderWidth: 0}, extra);
+
+    echart = new Chart($('echart'), {
+      type: 'line',
+      data: {labels, datasets: [
+        mk('p10', band('p10'), {}),
+        mk('80% range', band('p90'), {fill: '-1', backgroundColor: 'rgba(214,92,31,.12)'}),
+        mk('p25', band('p25'), {}),
+        mk('50% range', band('p75'), {fill: '-1', backgroundColor: 'rgba(214,92,31,.25)'}),
+        mk('ETS median, ' + a.unit, band('median'), {borderWidth: 2, borderColor: '#d65c1f'})
+      ]},
+      options: {
+        interaction: {mode: 'index', intersect: false},
+        scales: {x: {ticks: {maxTicksLimit: 8}}},
+        plugins: {legend: {labels: {filter: i => [1, 3, 4].includes(i.datasetIndex)}}}
+      }
+    });
+    const p = a.params || {};
+    $('enote').textContent = fdata.method + '. alpha=' + p.alpha + ', beta=' + p.beta + ', phi=' + p.phi +
+      ', daily sd=' + (p.daily_sd * 100).toFixed(2) + '%. Generated ' + fdata.generated +
+      '. Statistical estimate, not financial advice.';
+    $('err').textContent = '';
+  }catch(e){ fail(e); }
+}
+$('easset').innerHTML = $('asset').innerHTML;
+$('easset').onchange = $('ehorizon').onchange = drawEts;
+document.querySelector('[data-tab="predictions"]').addEventListener('click', drawEts);
+
+let pchart; const pcache = {};
+function randn(){ let u = 0; while(u === 0) u = Math.random(); const v = Math.random(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+function pct(sorted, q){ return sorted[Math.floor(q*(sorted.length-1))]; }
+
+async function drawCone(){
+  try{
+    const asset = $('passet').value, H = +$('phorizon').value;
+    if(!pcache[asset]) pcache[asset] = await history(asset, 365);
+    const h = pcache[asset], p = h.data;
+
+    const r = [];
+    for(let i = 1; i < p.length; i++) r.push(Math.log(p[i]/p[i-1]));
+    const mean = r.reduce((a,b) => a+b, 0)/r.length;
+    const sd = Math.sqrt(r.reduce((a,b) => a+(b-mean)*(b-mean), 0)/(r.length-1));
+
+    const N = 2000, last = p[p.length-1];
+    const cols = Array.from({length: H}, () => new Array(N));
+    for(let n = 0; n < N; n++){
+      let x = last;
+      for(let k = 0; k < H; k++){ x *= Math.exp(sd*randn()); cols[k][n] = x; }
+    }
+    cols.forEach(c => c.sort((a,b) => a-b));
+
+    const T = Math.min(60, p.length);
+    const pad = new Array(T-1).fill(null);
+    const band = q => [...pad, last, ...cols.map(c => pct(c, q))];
+    const hist = [...p.slice(-T), ...new Array(H).fill(null)];
+    const future = Array.from({length: H}, (_, k) => new Date(Date.now()+(k+1)*864e5).toLocaleDateString('en-GB'));
+    const labels = [...h.labels.slice(-T), ...future];
+
+    const name = $('passet').selectedOptions[0].text;
+    const mk = (label, data, extra) => Object.assign({label, data, pointRadius: 0, borderWidth: 0, spanGaps: false}, extra);
+
+    if(pchart) pchart.destroy();
+    pchart = new Chart($('pchart'), {
+      type: 'line',
+      data: {labels, datasets: [
+        mk(name + ', ' + h.cur, hist, {borderWidth: 2, borderColor: '#1f6feb'}),
+        mk('p10', band(0.10), {}),
+        mk('80% range', band(0.90), {fill: '-1', backgroundColor: 'rgba(31,111,235,.12)'}),
+        mk('p25', band(0.25), {}),
+        mk('50% range', band(0.75), {fill: '-1', backgroundColor: 'rgba(31,111,235,.25)'}),
+        mk('Median', band(0.50), {borderWidth: 2, borderDash: [6,4], borderColor: '#1f6feb'})
+      ]},
+      options: {
+        interaction: {mode: 'index', intersect: false},
+        scales: {x: {ticks: {maxTicksLimit: 8}}},
+        plugins: {legend: {labels: {filter: i => [0,2,4,5].includes(i.datasetIndex)}}}
+      }
+    });
+    $('pnote').textContent = 'Daily volatility ' + (sd*100).toFixed(2) + '% (last ' + r.length + ' days), zero drift, ' + N + ' simulated paths. Statistical estimate, not financial advice.';
+    $('err').textContent = '';
+  }catch(e){ fail(e); }
+}
+$('passet').innerHTML = $('asset').innerHTML;
+$('passet').onchange = $('phorizon').onchange = drawCone;
+document.querySelector('[data-tab="predictions"]').addEventListener('click', drawCone);
+
+drawChart();
+// ---- Europe earthquake indicator (EMSC WebSocket) ----
+const QUAKE = {minMag: 3.0, hours: 6, lat: [34, 72], lon: [-25, 45]};
+const quakes = new Map();
+let qws = null, qretry = 0, qSince = '', qBackfilled = false;
+
+function inEurope(lat, lon){
+  return lat >= QUAKE.lat[0] && lat <= QUAKE.lat[1] && lon >= QUAKE.lon[0] && lon <= QUAKE.lon[1];
+}
+function quakeAdd(f){
+  const p = f.properties || {}, c = (f.geometry && f.geometry.coordinates) || [];
+  const id = p.unid || f.id, mag = +p.mag, t = Date.parse(p.time);
+  const lat = +(p.lat != null ? p.lat : c[1]), lon = +(p.lon != null ? p.lon : c[0]);
+  if(!id || isNaN(mag) || isNaN(t) || isNaN(lat) || isNaN(lon)) return;
+  if(mag >= QUAKE.minMag && inEurope(lat, lon)) quakes.set(id, {id, mag, t, region: p.flynn_region || 'Unknown region'});
+  else quakes.delete(id);
+}
+function quakeRender(){
+  const cutoff = Date.now() - QUAKE.hours * 3600e3;
+  for(const [id, q] of quakes) if(q.t < cutoff) quakes.delete(id);
+  const dot = $('qdot'), txt = $('qtext');
+  $('qws').textContent = '· WebSocket: ' + (qws && qws.readyState === 1 ? 'connected' : 'reconnecting');
+  if(!qws || qws.readyState !== 1){ dot.className = 'qdot gray'; txt.textContent = 'Connecting to EMSC...'; return; }
+  const list = [...quakes.values()].sort((a, b) => b.mag - a.mag);
+  if(!list.length){
+    dot.className = 'qdot green';
+    txt.textContent = qBackfilled
+      ? 'No M' + QUAKE.minMag + '+ earthquakes in Europe in the last ' + QUAKE.hours + ' h.'
+      : 'No M' + QUAKE.minMag + '+ earthquakes in Europe since connected at ' + qSince + ' (history unavailable).';
+  } else {
+    dot.className = 'qdot red';
+    const top = list[0];
+    txt.textContent = list.length + ' earthquake(s) M' + QUAKE.minMag + '+ in Europe in the last ' + QUAKE.hours +
+      ' h. Strongest: M' + top.mag + ' ' + top.region + ' (' + new Date(top.t).toISOString().slice(11, 16) + ' UTC)';
+  }
+}
+async function quakeBackfill(){
+  try{
+    const start = new Date(Date.now() - QUAKE.hours * 3600e3).toISOString().slice(0, 19);
+    const url = 'https://www.seismicportal.eu/fdsnws/event/1/query?format=json&limit=100&start=' + start +
+      '&minmag=' + QUAKE.minMag + '&minlat=' + QUAKE.lat[0] + '&maxlat=' + QUAKE.lat[1] +
+      '&minlon=' + QUAKE.lon[0] + '&maxlon=' + QUAKE.lon[1];
+    const r = await fetch(url);
+    if(!r.ok) throw new Error(r.status);
+    ((await r.json()).features || []).forEach(quakeAdd);
+    qBackfilled = true;
+  }catch(e){ qBackfilled = false; }
+}
+function quakeConnect(){
+  qws = new WebSocket('wss://www.seismicportal.eu/standing_order/websocket');
+  qws.onopen = () => {
+    qretry = 0;
+    qSince = new Date().toLocaleTimeString('en-GB');
+    quakeRender();
+    quakeBackfill().then(quakeRender);
+  };
+  qws.onmessage = ev => {
+    try{ const m = JSON.parse(ev.data); if(m && m.data) quakeAdd(m.data); }catch(e){}
+    quakeRender();
+  };
+  qws.onclose = () => { quakeRender(); setTimeout(quakeConnect, Math.min(60000, 2000 * Math.pow(2, qretry++))); };
+}
+quakeConnect();
+setInterval(quakeRender, 30000);
+
+setInterval(() => loadTables().catch(fail), 120000);
+</script>
+</body>
+</html>
