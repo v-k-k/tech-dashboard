@@ -10,35 +10,13 @@
  *   FeedEntity:  vehicle = 4
  * An entity that contains field 4 is one vehicle position.
  */
-#include <curl/curl.h>
+#include "http_client.h"
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#define MAXBYTES (8u * 1024u * 1024u)
-#define PREFIX   "https://gtfs.ztp.krakow.pl/"
-
-struct buf { unsigned char *d; size_t n, cap; };
-
-static size_t write_cb(void *p, size_t sz, size_t nm, void *u)
-{
-    struct buf *b = u;
-    size_t k = sz * nm;
-    if (b->n + k > MAXBYTES) return 0;
-    if (b->n + k > b->cap) {
-        size_t nc = b->cap ? b->cap : 65536;
-        while (nc < b->n + k) nc *= 2;
-        unsigned char *t = realloc(b->d, nc);
-        if (!t) return 0;
-        b->d = t;
-        b->cap = nc;
-    }
-    memcpy(b->d + b->n, p, k);
-    b->n += k;
-    return k;
-}
+#define PREFIX "https://gtfs.ztp.krakow.pl/"
 
 static int rd_varint(const unsigned char **p, const unsigned char *end, uint64_t *v)
 {
@@ -112,44 +90,34 @@ static int parse(const unsigned char *d, size_t n, long *vehicles, uint64_t *ts)
 
 int main(int argc, char **argv)
 {
-    struct buf b = {0, 0, 0};
-    CURL *c;
-    CURLcode rc;
-    long http = 0, vehicles = 0;
+    struct http_req rq = {0};
+    struct http_resp rs;
+    long vehicles = 0;
     uint64_t ts = 0;
+    int rc;
 
     if (argc != 2 || strncmp(argv[1], PREFIX, strlen(PREFIX)) != 0) {
         fprintf(stderr, "usage: %s %s<file>.pb\n", argv[0], PREFIX);
         return 1;
     }
+    rq.url = argv[1];
+    rq.prefix = PREFIX;
+    rq.timeout_s = 10;
+    rq.compress = 1;
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    c = curl_easy_init();
-    if (!c) return 2;
-    curl_easy_setopt(c, CURLOPT_URL, argv[1]);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
-    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(c, CURLOPT_USERAGENT, "tech-tab/1.0");
-    rc = curl_easy_perform(c);
-    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http);
-    curl_easy_cleanup(c);
-    curl_global_cleanup();
-
-    if (rc != CURLE_OK || http != 200 || b.n == 0) {
-        fprintf(stderr, "download failed (curl %d, http %ld)\n", (int)rc, http);
-        free(b.d);
+    rc = http_request(&rq, &rs);
+    if (rc != 0 || rs.status != 200 || rs.len == 0) {
+        fprintf(stderr, "download failed (code %d, http %ld)\n", rc, rs.status);
+        http_free(&rs);
         return 2;
     }
-    if (!parse(b.d, b.n, &vehicles, &ts)) {
+    if (!parse(rs.data, rs.len, &vehicles, &ts)) {
         fprintf(stderr, "not a valid protobuf feed\n");
-        free(b.d);
+        http_free(&rs);
         return 3;
     }
     printf("%ld %lld\n", vehicles, ts ? (long long)time(NULL) - (long long)ts : -1LL);
-    free(b.d);
+    http_free(&rs);
     return 0;
 }
 
